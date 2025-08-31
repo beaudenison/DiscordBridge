@@ -359,6 +359,119 @@ class CrossServerMessaging(commands.Cog):
         )
         await interaction.response.send_message(embed=embed)
 
+    @app_commands.command(name="to", description="Send a message to a specific server")
+    @app_commands.describe(
+        target_server="The name of the server to send the message to",
+        message="The message to send"
+    )
+    async def send_to_server(self, interaction: discord.Interaction, target_server: str, message: str):
+        """Send a message to a specific server"""
+        
+        # Check if current server is configured
+        if interaction.guild_id not in self.broadcast_channels:
+            embed = discord.Embed(
+                title="❌ Server Not Configured",
+                description="This server is not set up for cross-server messaging. Use `/setup` to configure it.",
+                color=0xe74c3c
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        
+        # Check rate limit
+        if not await self.check_rate_limit(interaction.user.id, interaction.guild_id):
+            embed = discord.Embed(
+                title="⏰ Rate Limited",
+                description="You're sending messages too quickly. Please wait before sending another message.",
+                color=0xf39c12
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        
+        # Find target server
+        target_guild_id = None
+        target_config = None
+        
+        for guild_id, config in self.broadcast_channels.items():
+            if config['name'].lower() == target_server.lower() and config['enabled']:
+                target_guild_id = guild_id
+                target_config = config
+                break
+        
+        if not target_config:
+            # List available servers
+            available_servers = [config['name'] for config in self.broadcast_channels.values() if config['enabled']]
+            server_list = '\n'.join([f"• {name}" for name in available_servers]) or "No servers available"
+            
+            embed = discord.Embed(
+                title="❌ Server Not Found",
+                description=f"Server '{target_server}' not found or not available.",
+                color=0xe74c3c
+            )
+            embed.add_field(name="Available Servers", value=server_list, inline=False)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        
+        # Get target channel
+        target_channel = self.bot.get_channel(target_config['channel_id'])
+        if not target_channel:
+            embed = discord.Embed(
+                title="❌ Target Channel Not Found",
+                description="The target channel is not accessible. The bot may have lost access to it.",
+                color=0xe74c3c
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        
+        # Create embed for the targeted message
+        source_server_name = self.broadcast_channels[interaction.guild_id]['name']
+        
+        embed = discord.Embed(
+            description=message,
+            color=0x9b59b6,  # Different color for targeted messages
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.set_author(
+            name=f"{interaction.user.display_name}",
+            icon_url=interaction.user.display_avatar.url
+        )
+        embed.set_footer(
+            text=f"Direct from: {source_server_name} → {target_config['name']}",
+            icon_url=interaction.guild.icon.url if interaction.guild.icon else None
+        )
+        
+        try:
+            # Send message to target server
+            sent_message = await self.safe_send_message(target_channel, embed=embed)
+            
+            if sent_message:
+                # Confirmation embed
+                confirm_embed = discord.Embed(
+                    title="✅ Message Sent",
+                    description=f"Your message has been sent to **{target_config['name']}**",
+                    color=0x2ecc71
+                )
+                confirm_embed.add_field(name="Target Channel", value=target_channel.mention, inline=True)
+                
+                await interaction.response.send_message(embed=confirm_embed, ephemeral=True)
+                
+                self.logger.info(f"Direct message sent from {source_server_name} to {target_config['name']} by {interaction.user}")
+            else:
+                embed = discord.Embed(
+                    title="❌ Failed to Send Message",
+                    description="I don't have permission to send messages to the target channel.",
+                    color=0xe74c3c
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                
+        except Exception as e:
+            self.logger.error(f"Error sending direct message: {e}")
+            embed = discord.Embed(
+                title="❌ Failed to Send Message",
+                description="An error occurred while sending your message. Please try again later.",
+                color=0xe74c3c
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
     @app_commands.command(name="help", description="Show help information for the cross-server bot")
     async def help_command(self, interaction: discord.Interaction):
         """Display help information for cross-server commands"""
@@ -370,6 +483,7 @@ class CrossServerMessaging(commands.Cog):
         
         commands_info = [
             ("/setup <name> [channel]", "Set up broadcast channel for this server (Admin only)"),
+            ("/to <server> <message>", "Send a message to a specific server"),
             ("/servers", "List all connected servers in the network"),
             ("/enable", "Enable cross-server broadcasting (Admin only)"),
             ("/disable", "Disable cross-server broadcasting (Admin only)"),
