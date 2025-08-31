@@ -9,7 +9,7 @@ class Config:
     """Configuration class for bot settings"""
     
     # Bot settings
-    COMMAND_PREFIX = os.getenv('COMMAND_PREFIX', '!')
+    COMMAND_PREFIX = os.getenv('COMMAND_PREFIX', '/')
     
     # Discord settings
     DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')

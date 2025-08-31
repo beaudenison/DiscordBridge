@@ -1,15 +1,15 @@
 """
 Cross-Server Messaging Cog
-Handles all cross-server messaging functionality
+Handles all cross-server messaging functionality with slash commands and auto-broadcast
 """
 
 import discord
 from discord.ext import commands
+from discord import app_commands
 import asyncio
-import json
+import io
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
-import io
 
 class CrossServerMessaging(commands.Cog):
     """Cog for handling cross-server messaging functionality"""
@@ -18,12 +18,9 @@ class CrossServerMessaging(commands.Cog):
         self.bot = bot
         self.logger = bot.logger
         
-        # Dictionary to store server configurations
+        # Dictionary to store server broadcast channels
         # Format: {guild_id: {'name': 'server_name', 'channel_id': channel_id, 'enabled': True}}
-        self.server_config = {}
-        
-        # Message cache for tracking cross-server messages
-        self.message_cache = {}
+        self.broadcast_channels = {}
         
         # Rate limiting dictionary
         self.rate_limits = {}
@@ -36,9 +33,9 @@ class CrossServerMessaging(commands.Cog):
         """Generate rate limit key for user"""
         return f"{user_id}:{guild_id}"
 
-    async def check_rate_limit(self, ctx) -> bool:
+    async def check_rate_limit(self, user_id: int, guild_id: int) -> bool:
         """Check if user is rate limited"""
-        key = self.get_rate_limit_key(ctx.author.id, ctx.guild.id)
+        key = self.get_rate_limit_key(user_id, guild_id)
         now = datetime.now(timezone.utc)
         
         if key in self.rate_limits:
@@ -77,7 +74,7 @@ class CrossServerMessaging(commands.Cog):
                     retry_delay *= 2
                 elif e.status == 403:  # Forbidden
                     self.logger.error(f"No permission to send message to channel {channel.id}")
-                    raise commands.BotMissingPermissions(["send_messages"])
+                    return None
                 elif attempt == max_retries - 1:
                     raise
                 else:
@@ -88,202 +85,207 @@ class CrossServerMessaging(commands.Cog):
                     raise
                 await asyncio.sleep(retry_delay)
 
-    @commands.command(name='setup', aliases=['config'])
-    @commands.has_permissions(administrator=True)
-    async def setup_server(self, ctx, server_name: str, channel: Optional[discord.TextChannel] = None):
-        """
-        Setup current server for cross-server messaging
+    @app_commands.command(name="setup", description="Set up a broadcast channel for cross-server messaging")
+    @app_commands.describe(
+        server_name="A unique name for this server",
+        channel="The channel to receive messages from other servers (defaults to current channel)"
+    )
+    async def setup_server(self, interaction: discord.Interaction, server_name: str, channel: Optional[discord.TextChannel] = None):
+        """Setup current server for cross-server messaging"""
         
-        Usage: !setup <server_name> [channel]
-        """
+        # Check permissions - interaction.user is Member in guilds
+        if not hasattr(interaction.user, 'guild_permissions') or not interaction.user.guild_permissions.administrator:
+            embed = discord.Embed(
+                title="❌ Missing Permissions",
+                description="You need administrator permissions to set up cross-server messaging.",
+                color=0xe74c3c
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        
+        # Use current channel if none specified
         if not channel:
-            channel = ctx.channel
+            if isinstance(interaction.channel, discord.TextChannel):
+                channel = interaction.channel
+            else:
+                embed = discord.Embed(
+                    title="❌ Invalid Channel",
+                    description="This command must be used in a text channel, or specify a text channel.",
+                    color=0xe74c3c
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
         
         # Check if server name is already taken
-        for guild_id, config in self.server_config.items():
-            if config['name'].lower() == server_name.lower() and guild_id != ctx.guild.id:
+        for guild_id, config in self.broadcast_channels.items():
+            if config['name'].lower() == server_name.lower() and guild_id != interaction.guild_id:
                 embed = discord.Embed(
                     title="❌ Server Name Taken",
                     description=f"The server name '{server_name}' is already in use by another server.",
                     color=0xe74c3c
                 )
-                await ctx.send(embed=embed)
+                await interaction.response.send_message(embed=embed, ephemeral=True)
                 return
         
         # Store server configuration
-        self.server_config[ctx.guild.id] = {
+        self.broadcast_channels[interaction.guild_id] = {
             'name': server_name,
             'channel_id': channel.id,
             'enabled': True
         }
         
         embed = discord.Embed(
-            title="✅ Server Setup Complete",
-            description=f"Server configured for cross-server messaging",
+            title="✅ Broadcast Channel Setup Complete",
+            description=f"This server is now connected to the cross-server network!",
             color=0x2ecc71
         )
         embed.add_field(name="Server Name", value=server_name, inline=True)
-        embed.add_field(name="Channel", value=channel.mention, inline=True)
+        embed.add_field(name="Broadcast Channel", value=channel.mention, inline=True)
         embed.add_field(name="Status", value="Enabled", inline=True)
+        embed.add_field(
+            name="📡 How it works", 
+            value="Messages sent in this channel will be broadcast to all other connected servers!", 
+            inline=False
+        )
         
-        await ctx.send(embed=embed)
-        self.logger.info(f"Setup server: {ctx.guild.name} as '{server_name}' in channel {channel.name}")
+        await interaction.response.send_message(embed=embed)
+        self.logger.info(f"Setup server: {interaction.guild.name} as '{server_name}' in channel {channel.name}")
 
-    @commands.command(name='send', aliases=['msg'])
-    async def send_cross_server(self, ctx, target_server: str, *, message: str):
-        """
-        Send a message to another server
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        """Listen for messages in broadcast channels and forward them to other servers"""
         
-        Usage: !send <target_server> <message>
-        """
+        # Ignore bot messages
+        if message.author.bot:
+            return
+        
+        # Check if message is from a configured broadcast channel
+        if message.guild.id not in self.broadcast_channels:
+            return
+        
+        config = self.broadcast_channels[message.guild.id]
+        if not config['enabled'] or message.channel.id != config['channel_id']:
+            return
+        
         # Check rate limit
-        if not await self.check_rate_limit(ctx):
-            embed = discord.Embed(
-                title="⏰ Rate Limited",
-                description="You're sending messages too quickly. Please wait before sending another message.",
-                color=0xf39c12
-            )
-            await ctx.send(embed=embed)
+        if not await self.check_rate_limit(message.author.id, message.guild.id):
+            try:
+                embed = discord.Embed(
+                    title="⏰ Rate Limited",
+                    description="You're sending messages too quickly. Please wait before sending another message.",
+                    color=0xf39c12
+                )
+                await message.channel.send(embed=embed, delete_after=10)
+            except:
+                pass
             return
         
-        # Check if current server is configured
-        if ctx.guild.id not in self.server_config:
-            embed = discord.Embed(
-                title="❌ Server Not Configured",
-                description=f"This server is not set up for cross-server messaging. Use `{self.bot.config.COMMAND_PREFIX}setup` to configure it.",
-                color=0xe74c3c
-            )
-            await ctx.send(embed=embed)
+        # Skip empty messages
+        if not message.content.strip() and not message.attachments:
             return
         
-        # Find target server
-        target_guild_id = None
-        target_config = None
-        
-        for guild_id, config in self.server_config.items():
-            if config['name'].lower() == target_server.lower() and config['enabled']:
-                target_guild_id = guild_id
-                target_config = config
-                break
-        
-        if not target_config:
-            # List available servers
-            available_servers = [config['name'] for config in self.server_config.values() if config['enabled']]
-            server_list = '\n'.join([f"• {name}" for name in available_servers]) or "No servers available"
-            
-            embed = discord.Embed(
-                title="❌ Server Not Found",
-                description=f"Server '{target_server}' not found or not available.",
-                color=0xe74c3c
-            )
-            embed.add_field(name="Available Servers", value=server_list, inline=False)
-            await ctx.send(embed=embed)
-            return
-        
-        # Get target channel
-        target_channel = self.bot.get_channel(target_config['channel_id'])
-        if not target_channel:
-            embed = discord.Embed(
-                title="❌ Target Channel Not Found",
-                description="The target channel is not accessible. The bot may have lost access to it.",
-                color=0xe74c3c
-            )
-            await ctx.send(embed=embed)
-            return
-        
-        # Create embed for the cross-server message
-        source_server_name = self.server_config[ctx.guild.id]['name']
-        
+        # Create embed for the cross-server broadcast
         embed = discord.Embed(
-            description=message,
+            description=message.content or "*[No text content]*",
             color=0x3498db,
             timestamp=datetime.now(timezone.utc)
         )
         embed.set_author(
-            name=f"{ctx.author.display_name}",
-            icon_url=ctx.author.display_avatar.url
+            name=f"{message.author.display_name}",
+            icon_url=message.author.display_avatar.url
         )
         embed.set_footer(
-            text=f"From: {source_server_name} → {target_config['name']}",
-            icon_url=ctx.guild.icon.url if ctx.guild.icon else None
+            text=f"From: {config['name']}",
+            icon_url=message.guild.icon.url if message.guild.icon else None
         )
         
-        try:
-            # Send message to target server
-            sent_message = await self.safe_send_message(target_channel, embed=embed)
+        # Handle attachments
+        files = []
+        if message.attachments:
+            for attachment in message.attachments[:5]:  # Limit to 5 attachments
+                try:
+                    if attachment.size <= 8388608:  # 8MB Discord limit
+                        file_data = await attachment.read()
+                        files.append(discord.File(
+                            fp=io.BytesIO(file_data),
+                            filename=attachment.filename
+                        ))
+                except:
+                    pass  # Skip failed attachments
+        
+        # Broadcast to all other configured servers
+        broadcast_count = 0
+        failed_count = 0
+        
+        for target_guild_id, target_config in self.broadcast_channels.items():
+            # Skip the source server and disabled servers
+            if target_guild_id == message.guild.id or not target_config['enabled']:
+                continue
             
-            # Confirmation embed
-            confirm_embed = discord.Embed(
-                title="✅ Message Sent",
-                description=f"Your message has been sent to **{target_config['name']}**",
-                color=0x2ecc71
-            )
-            confirm_embed.add_field(name="Target Channel", value=target_channel.mention, inline=True)
-            if sent_message:
-                confirm_embed.add_field(name="Message ID", value=str(sent_message.id), inline=True)
-            
-            await ctx.send(embed=confirm_embed)
-            
-            # Log the message
-            log_entry = {
-                'timestamp': datetime.now(timezone.utc).isoformat(),
-                'from_server': source_server_name,
-                'to_server': target_config['name'],
-                'author': str(ctx.author),
-                'message': message
-            }
-            self.bot.message_log.append(log_entry)
-            
-            self.logger.info(f"Cross-server message sent from {source_server_name} to {target_config['name']} by {ctx.author}")
-            
-        except commands.BotMissingPermissions:
-            embed = discord.Embed(
-                title="❌ Missing Permissions",
-                description="I don't have permission to send messages to the target channel.",
-                color=0xe74c3c
-            )
-            await ctx.send(embed=embed)
-        except Exception as e:
-            self.logger.error(f"Error sending cross-server message: {e}")
-            embed = discord.Embed(
-                title="❌ Failed to Send Message",
-                description="An error occurred while sending your message. Please try again later.",
-                color=0xe74c3c
-            )
-            await ctx.send(embed=embed)
+            target_channel = self.bot.get_channel(target_config['channel_id'])
+            if target_channel:
+                try:
+                    # Create new file objects for each send (Discord requires this)
+                    send_files = []
+                    if files:
+                        for original_file in files:
+                            original_file.fp.seek(0)  # Reset file pointer
+                            new_file_data = original_file.fp.read()
+                            original_file.fp.seek(0)  # Reset again for next use
+                            send_files.append(discord.File(
+                                fp=io.BytesIO(new_file_data),
+                                filename=original_file.filename
+                            ))
+                    
+                    await self.safe_send_message(target_channel, embed=embed, files=send_files)
+                    broadcast_count += 1
+                except Exception as e:
+                    failed_count += 1
+                    self.logger.error(f"Failed to broadcast to {target_config['name']}: {e}")
+        
+        # Add a reaction to show the message was broadcast
+        if broadcast_count > 0:
+            try:
+                await message.add_reaction("📡")  # Broadcast emoji
+            except:
+                pass
+        
+        self.logger.info(f"Broadcast message from {config['name']} to {broadcast_count} servers (failed: {failed_count})")
 
-    @commands.command(name='servers', aliases=['list'])
-    async def list_servers(self, ctx):
+    @app_commands.command(name="servers", description="List all connected servers in the cross-server network")
+    async def list_servers(self, interaction: discord.Interaction):
         """List all available servers for cross-server messaging"""
-        if not self.server_config:
+        if not self.broadcast_channels:
             embed = discord.Embed(
-                title="📋 Available Servers",
-                description="No servers are currently configured for cross-server messaging.",
+                title="📋 Connected Servers",
+                description="No servers are currently connected to the cross-server network.",
                 color=0x95a5a6
             )
-            await ctx.send(embed=embed)
+            await interaction.response.send_message(embed=embed)
             return
         
         # Build server list
         server_list = []
-        for guild_id, config in self.server_config.items():
+        for guild_id, config in self.broadcast_channels.items():
             if config['enabled']:
                 guild = self.bot.get_guild(guild_id)
                 status = "🟢 Online" if guild else "🔴 Offline"
-                server_list.append(f"**{config['name']}** - {status}")
+                channel = self.bot.get_channel(config['channel_id'])
+                channel_name = f"#{channel.name}" if channel else "Unknown Channel"
+                server_list.append(f"**{config['name']}** - {status} ({channel_name})")
         
         if not server_list:
-            description = "No servers are currently available for messaging."
+            description = "No servers are currently available for broadcasting."
         else:
             description = '\n'.join(server_list)
         
         embed = discord.Embed(
-            title="📋 Available Servers",
+            title="📋 Connected Servers",
             description=description,
             color=0x3498db
         )
         
-        current_server = self.server_config.get(ctx.guild.id)
+        current_server = self.broadcast_channels.get(interaction.guild_id)
         if current_server:
             embed.add_field(
                 name="Current Server",
@@ -291,76 +293,100 @@ class CrossServerMessaging(commands.Cog):
                 inline=False
             )
         
-        await ctx.send(embed=embed)
+        await interaction.response.send_message(embed=embed)
 
-    @commands.command(name='disable')
-    @commands.has_permissions(administrator=True)
-    async def disable_server(self, ctx):
+    @app_commands.command(name="disable", description="Disable cross-server broadcasting for this server")
+    async def disable_server(self, interaction: discord.Interaction):
         """Disable cross-server messaging for this server"""
-        if ctx.guild.id not in self.server_config:
+        
+        # Check permissions
+        if not hasattr(interaction.user, 'guild_permissions') or not interaction.user.guild_permissions.administrator:
+            embed = discord.Embed(
+                title="❌ Missing Permissions",
+                description="You need administrator permissions to disable cross-server messaging.",
+                color=0xe74c3c
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        
+        if interaction.guild_id not in self.broadcast_channels:
             embed = discord.Embed(
                 title="❌ Server Not Configured",
                 description="This server is not configured for cross-server messaging.",
                 color=0xe74c3c
             )
-            await ctx.send(embed=embed)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             return
         
-        self.server_config[ctx.guild.id]['enabled'] = False
+        self.broadcast_channels[interaction.guild_id]['enabled'] = False
         
         embed = discord.Embed(
             title="⚠️ Server Disabled",
-            description="Cross-server messaging has been disabled for this server.",
+            description="Cross-server broadcasting has been disabled for this server.",
             color=0xf39c12
         )
-        await ctx.send(embed=embed)
+        await interaction.response.send_message(embed=embed)
 
-    @commands.command(name='enable')
-    @commands.has_permissions(administrator=True)
-    async def enable_server(self, ctx):
+    @app_commands.command(name="enable", description="Enable cross-server broadcasting for this server")
+    async def enable_server(self, interaction: discord.Interaction):
         """Enable cross-server messaging for this server"""
-        if ctx.guild.id not in self.server_config:
+        
+        # Check permissions
+        if not hasattr(interaction.user, 'guild_permissions') or not interaction.user.guild_permissions.administrator:
             embed = discord.Embed(
-                title="❌ Server Not Configured",
-                description=f"This server is not configured for cross-server messaging. Use `{self.bot.config.COMMAND_PREFIX}setup` to configure it.",
+                title="❌ Missing Permissions",
+                description="You need administrator permissions to enable cross-server messaging.",
                 color=0xe74c3c
             )
-            await ctx.send(embed=embed)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             return
         
-        self.server_config[ctx.guild.id]['enabled'] = True
+        if interaction.guild_id not in self.broadcast_channels:
+            embed = discord.Embed(
+                title="❌ Server Not Configured",
+                description="This server is not configured for cross-server messaging. Use `/setup` to configure it.",
+                color=0xe74c3c
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        
+        self.broadcast_channels[interaction.guild_id]['enabled'] = True
         
         embed = discord.Embed(
             title="✅ Server Enabled",
-            description="Cross-server messaging has been enabled for this server.",
+            description="Cross-server broadcasting has been enabled for this server.",
             color=0x2ecc71
         )
-        await ctx.send(embed=embed)
+        await interaction.response.send_message(embed=embed)
 
-    @commands.command(name='help')
-    async def help_command(self, ctx):
+    @app_commands.command(name="help", description="Show help information for the cross-server bot")
+    async def help_command(self, interaction: discord.Interaction):
         """Display help information for cross-server commands"""
         embed = discord.Embed(
             title="🤖 Cross-Server Bot Help",
-            description="Enable messaging between Discord servers",
+            description="Automatically broadcast messages between Discord servers",
             color=0x3498db
         )
         
         commands_info = [
-            (f"{self.bot.config.COMMAND_PREFIX}setup <name> [channel]", "Configure server for cross-server messaging (Admin only)"),
-            (f"{self.bot.config.COMMAND_PREFIX}send <server> <message>", "Send a message to another server"),
-            (f"{self.bot.config.COMMAND_PREFIX}servers", "List all available servers"),
-            (f"{self.bot.config.COMMAND_PREFIX}enable", "Enable cross-server messaging (Admin only)"),
-            (f"{self.bot.config.COMMAND_PREFIX}disable", "Disable cross-server messaging (Admin only)"),
-            (f"{self.bot.config.COMMAND_PREFIX}help", "Show this help message")
+            ("/setup <name> [channel]", "Set up broadcast channel for this server (Admin only)"),
+            ("/servers", "List all connected servers in the network"),
+            ("/enable", "Enable cross-server broadcasting (Admin only)"),
+            ("/disable", "Disable cross-server broadcasting (Admin only)"),
+            ("/help", "Show this help message")
         ]
         
         for command, description in commands_info:
             embed.add_field(name=command, value=description, inline=False)
         
-        embed.set_footer(text="Note: Rate limit is 5 messages per minute per user")
+        embed.add_field(
+            name="📡 How Broadcasting Works",
+            value="Once set up, any message sent in your broadcast channel will automatically be sent to all other connected servers!",
+            inline=False
+        )
+        embed.set_footer(text="Rate limit: 5 messages per minute per user")
         
-        await ctx.send(embed=embed)
+        await interaction.response.send_message(embed=embed)
 
 async def setup(bot):
     """Setup function to add the cog to the bot"""

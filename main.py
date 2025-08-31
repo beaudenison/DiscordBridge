@@ -47,7 +47,7 @@ class CrossServerBot(commands.Bot):
             await self.load_extension('cogs.cross_server')
             self.logger.info("Loaded cross-server messaging cog successfully")
             
-            # Sync slash commands (optional for future expansion)
+            # Sync slash commands
             try:
                 synced = await self.tree.sync()
                 self.logger.info(f"Synced {len(synced)} slash command(s)")
